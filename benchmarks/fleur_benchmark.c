@@ -9,19 +9,13 @@
 #include <fleur.h>
 
 enum {
-    kPeerCount = 10,
-    kBitmapBytes = 32,
-    kHashProbes = 13,
+    kTargetEntries = 15,
     kMaxKeyBytes = 32
 };
 
 static const double kTargetFalsePositive = 0.0001; /* 0.01% */
 static const size_t kLookupBatches = 1u << 18;
 static const size_t kRandomTrials = 1u << 20;
-
-static inline uint64_t div_round_up(uint64_t value, uint64_t step) {
-    return (value + (step - 1)) / step;
-}
 
 static inline double elapsed_ns(const struct timespec start,
                                 const struct timespec end) {
@@ -39,66 +33,49 @@ static uint64_t xorshift64(uint64_t *state) {
     return x;
 }
 
-static BloomFilter create_custom_filter(void) {
-    BloomFilter bf;
-    memset(&bf, 0, sizeof(BloomFilter));
-
-    bf.version = 1;
-    bf.datasize = 0;
-    bf.h.version = 1;
-    bf.h.n = kPeerCount;
-    bf.h.p = kTargetFalsePositive;
-    bf.h.k = kHashProbes;
-    bf.h.m = (uint64_t)kBitmapBytes * 8;
-    bf.h.N = 0;
-    bf.M = div_round_up(bf.h.m, 64);
-    bf.v = calloc(bf.M, sizeof(uint64_t));
-    bf.Data = calloc(1, sizeof(unsigned char));
-    bf.modified = 0;
-    bf.error = 0;
-
+static BloomFilter create_target_filter(void) {
+    BloomFilter bf = fleur_initialize(kTargetEntries, kTargetFalsePositive, "");
+    if (bf.v == NULL) {
+        bf.error = 1;
+    }
     return bf;
 }
 
 int main(void) {
-    BloomFilter bf = create_custom_filter();
-    if (bf.v == NULL || bf.Data == NULL) {
+    BloomFilter bf = create_target_filter();
+    if (bf.error != 0 || bf.v == NULL) {
         fprintf(stderr, "Failed to allocate bloom filter buffers\n");
-        free(bf.v);
-        free(bf.Data);
         return EXIT_FAILURE;
     }
 
-    char inserted[kPeerCount][kMaxKeyBytes];
+    char inserted[kTargetEntries][kMaxKeyBytes];
     struct timespec start, end;
 
     clock_gettime(CLOCK_MONOTONIC, &start);
-    for (uint64_t i = 0; i < kPeerCount; ++i) {
+    for (uint64_t i = 0; i < kTargetEntries; ++i) {
         snprintf(inserted[i], kMaxKeyBytes, "peer-%02" PRIu64, i);
         int rc = fleur_add(&bf, inserted[i], strlen(inserted[i]));
         if (rc == -1) {
             fprintf(stderr, "Filter saturated while inserting peer-%02" PRIu64 "\n", i);
             fleur_destroy_filter(&bf);
-            free(bf.Data);
             return EXIT_FAILURE;
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
-    const double insert_ns_per_op = elapsed_ns(start, end) / kPeerCount;
+    const double insert_ns_per_op = elapsed_ns(start, end) / kTargetEntries;
 
-    for (uint64_t i = 0; i < kPeerCount; ++i) {
+    for (uint64_t i = 0; i < kTargetEntries; ++i) {
         if (fleur_check(&bf, inserted[i], strlen(inserted[i])) != 1) {
             fprintf(stderr, "Filter lookup failed for %s\n", inserted[i]);
             fleur_destroy_filter(&bf);
-            free(bf.Data);
             return EXIT_FAILURE;
         }
     }
 
-    const size_t total_member_checks = kLookupBatches * kPeerCount;
+    const size_t total_member_checks = kLookupBatches * kTargetEntries;
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (size_t batch = 0; batch < kLookupBatches; ++batch) {
-        for (uint64_t i = 0; i < kPeerCount; ++i) {
+        for (uint64_t i = 0; i < kTargetEntries; ++i) {
             (void)fleur_check(&bf, inserted[i], strlen(inserted[i]));
         }
     }
@@ -120,14 +97,17 @@ int main(void) {
     const double random_lookup_ns = elapsed_ns(start, end) / (double)kRandomTrials;
     const double measured_fp = (double)false_hits / (double)kRandomTrials;
 
+    const unsigned wire_bits = (unsigned)bf.h.m;
+    const size_t wire_bytes = bf.M * sizeof(uint64_t);
+
     printf("fleur benchmark\n");
-    printf(" peers: %d\n bitmap: %d bytes (%u bits)\n hashes: %d\n target FPR: %.5f%%\n",
-           kPeerCount,
-           kBitmapBytes,
-           (unsigned)(kBitmapBytes * 8),
-           kHashProbes,
+    printf(" peers: %" PRIu64 "\n bitmap: %zu bytes (%u bits)\n hashes: %" PRIu64 "\n target FPR: %.5f%%\n",
+           bf.h.n,
+           wire_bytes,
+           wire_bits,
+           bf.h.k,
            kTargetFalsePositive * 100.0);
-    printf(" inserts: %.2f ns/op for %d peers\n", insert_ns_per_op, kPeerCount);
+    printf(" inserts: %.2f ns/op for %" PRIu64 " peers\n", insert_ns_per_op, bf.h.n);
     printf(" member lookups: %.2f ns/op over %zu checks\n",
            member_lookup_ns, total_member_checks);
     printf(" random lookups: %.2f ns/op over %zu checks\n",
@@ -138,6 +118,5 @@ int main(void) {
            (size_t)kRandomTrials);
 
     fleur_destroy_filter(&bf);
-    free(bf.Data);
     return EXIT_SUCCESS;
 }
