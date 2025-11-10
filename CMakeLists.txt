@@ -11,6 +11,7 @@ add_subdirectory(myutils)
 if(TARGET_GROUP STREQUAL production)
     add_subdirectory(fleurcli)
     set_target_properties(fleurcli PROPERTIES C11_STANDARD_REQUIRED ON)
+    add_subdirectory(benchmarks)
 elseif(TARGET_GROUP STREQUAL test)
     include(CTest)
 
